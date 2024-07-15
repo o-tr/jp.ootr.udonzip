@@ -1,0 +1,21 @@
+﻿{
+  "name": "jp.ootr.udonzip",
+  "displayName": "UdonZip",
+  "version": "0.1.1",
+  "license": "MIT",
+  "unity": "2022.3",
+  "description": "UdonZip is a ZIP parser written in Udon for VRChat.",
+  "author": {
+    "email": "ootr@ootr.jp",
+    "name": "ootr",
+    "url": "https://github.com/o-tr"
+  },
+  "url": "https://github.com/o-tr/jp.ootr.common/releases/latest/download/jp.ootr.udonzip.zip",
+  "vpmDependencies": {
+    "com.vrchat.base": "3.6.1",
+    "com.vrchat.worlds": "3.6.1"
+  },
+  "legacyFolders": {
+    "Assets\\jp.ootr\\common": "dfb5a4aaee665134381f4f650ccb7bfa"
+  }
+}
