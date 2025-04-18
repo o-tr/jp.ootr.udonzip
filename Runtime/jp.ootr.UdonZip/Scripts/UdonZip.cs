@@ -42,7 +42,7 @@ using UnityEngine;
 
 namespace jp.ootr.UdonZip
 {
-    [UdonBehaviourSyncMode(BehaviourSyncMode.Manual)]
+    [UdonBehaviourSyncMode(BehaviourSyncMode.NoVariableSync)]
     // ReSharper disable IdentifierTypo
     // ReSharper disable StringLiteralTypo
     // ReSharper disable CommentTypo
