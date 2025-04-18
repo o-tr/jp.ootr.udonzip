@@ -1,7 +1,7 @@
 ﻿{
   "name": "jp.ootr.udon-zip",
   "displayName": "UdonZip",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "MIT",
   "unity": "2022.3",
   "description": "UdonZip is a ZIP parser written in Udon for VRChat.",
