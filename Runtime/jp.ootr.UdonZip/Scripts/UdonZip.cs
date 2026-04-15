@@ -276,7 +276,6 @@ namespace jp.ootr.UdonZip
          */
         private object[] ReadLFH(byte[] data, int addr)
         {
-            // LFH fixed header is 30 bytes
             // LFH fixed header is 30 bytes; verify PK\x03\x04 signature
             if (!EnsureRange(data, addr, 30)) return null;
             if (data[addr] != 0x50 || data[addr + 1] != 0x4B ||
@@ -1113,7 +1112,11 @@ namespace jp.ootr.UdonZip
         {
             if (length == 0) return "";
             if (useUtf8) return Encoding.UTF8.GetString(data, addr, length);
-            // Encoding.ASCII is not available in the Udon runtime; cast each byte to char instead
+            // Without EFS (bit 11), ZIP spec uses CP437 for filenames. CP437 and
+            // Encoding.GetEncoding(437) are not available in the Udon runtime, so we
+            // fall back to a byte-to-char cast (ISO-8859-1 / Latin-1 behavior) which
+            // preserves all byte values 0-255. Characters in the CP437-specific range
+            // 0x80-0x9F may render differently from their intended glyphs.
             var chars = new char[length];
             for (var i = 0; i < length; i++) chars[i] = (char)data[addr + i];
             return new string(chars);
