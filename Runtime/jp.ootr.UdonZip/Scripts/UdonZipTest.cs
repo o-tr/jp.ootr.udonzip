@@ -51,12 +51,27 @@ namespace jp.ootr.UdonZip
 
             // Extract the ZIP file and give an archive representation object
             var archive = udonZip.Extract(Convert.FromBase64String(data));
-            // Fetches the "File" representation object, containing data such as "last modified", CRC and extra fields. 
+            if (archive == null)
+            {
+                Debug.LogError("Failed to extract ZIP archive.");
+                return;
+            }
+            // Fetches the "File" representation object, containing data such as "last modified", CRC and extra fields.
             var file = udonZip.GetFile(archive, "word/document.xml");
+            if (file == null)
+            {
+                Debug.LogError("File 'word/document.xml' not found in archive.");
+                return;
+            }
             // Fetches the actual file data, the raw bytes decompressed.
             //   The first time you access a file it will decompress it if necessary.
             //   The second time and on it will always return the already compressed data, making it significantly faster.
             var fileData = udonZip.GetFileData(file);
+            if (fileData == null)
+            {
+                Debug.LogError("Failed to decompress file data.");
+                return;
+            }
             // Efficiently converts the byte array to a string by casting each byte to char.
             var rawXmlData = new char[fileData.Length];
             for (var i = 0; i != fileData.Length; i++) rawXmlData[i] = (char)fileData[i];
