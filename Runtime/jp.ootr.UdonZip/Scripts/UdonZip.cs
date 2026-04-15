@@ -377,9 +377,19 @@ namespace jp.ootr.UdonZip
                 var compressionMethod = (int)(ushort)lfh[LFH_COMPRESSION_METHOD];
                 var startOfData = (int)lfh[LFH_START_OF_DATA];
 
+                // LFH and CD compression method must agree; a mismatch indicates a malformed ZIP
+                if (compressionMethod != (int)(ushort)cd[CD_COMPRESSION_METHOD]) return null;
+
+                // When bit 3 of general purpose bit flag is set (data descriptor present),
+                // LFH sizes are 0. Fall back to CD sizes, which are always correct.
+                var lfhBitFlag = (ushort)lfh[LFH_BITFLAG];
+                var useDataDescriptor = (lfhBitFlag & 0x08) != 0;
+
                 if (compressionMethod == COMPRESSION_METHOD_NONE)
                 {
-                    var sizeUint = (uint)lfh[LFH_UNCOMPRESSED_SIZE];
+                    var sizeUint = useDataDescriptor
+                        ? (uint)cd[CD_UNCOMPRESSED_SIZE]
+                        : (uint)lfh[LFH_UNCOMPRESSED_SIZE];
                     if (sizeUint > (uint)maxUncompressedSize) return null;
                     var size = (int)sizeUint;
                     if (!EnsureRange(data, startOfData, size)) return null;
@@ -387,7 +397,9 @@ namespace jp.ootr.UdonZip
                 }
                 else if (compressionMethod == COMPRESSION_METHOD_INFLATE)
                 {
-                    var sizeUint = (uint)lfh[LFH_COMPRESSED_SIZE];
+                    var sizeUint = useDataDescriptor
+                        ? (uint)cd[CD_COMPRESSED_SIZE]
+                        : (uint)lfh[LFH_COMPRESSED_SIZE];
                     if (sizeUint > (uint)maxUncompressedSize) return null;
                     var size = (int)sizeUint;
                     if (!EnsureRange(data, startOfData, size)) return null;
@@ -456,9 +468,11 @@ namespace jp.ootr.UdonZip
             if (uncompressedSizeUint > (uint)maxUncompressedSize) return null;
             var uncompressedSize = (int)uncompressedSizeUint;
 
-            var uncompressedData = new byte[uncompressedSize];
+            // Check compressed data exists before allocating the output buffer
             var fileData = (byte[])fileEntry[FILEENTRY_COMPRESSED];
             if (fileData == null) return null;
+
+            var uncompressedData = new byte[uncompressedSize];
 
             // Switch depending on compression method
             var compressionMethod = (int)(ushort)cd[CD_COMPRESSION_METHOD];
@@ -568,7 +582,9 @@ namespace jp.ootr.UdonZip
         // ReSharper disable once ParameterHidesMember
         private bool INFLATEBuildTree(object[] t, byte[] lengths, int off, int num)
         {
+#if DEBUG
             Debug.Log("INFLATEBuildTree");
+#endif
             var table = (ushort[])t[INFLATE_TREE_TABLE];
             var trans = (ushort[])t[INFLATE_TREE_TRANS];
             var offs = new ushort[16];
@@ -632,7 +648,9 @@ namespace jp.ootr.UdonZip
         /* get one bit from source stream */
         private byte INFLATEReadBit(object[] d)
         {
+#if DEBUG
             Debug.Log("INFLATEReadBit");
+#endif
             /* check if tag is empty */
             d[INFLATE_DATA_BITCOUNT] = (int)d[INFLATE_DATA_BITCOUNT] - 1; // bitcount--
             if ((int)d[INFLATE_DATA_BITCOUNT] == -1)
@@ -662,7 +680,9 @@ namespace jp.ootr.UdonZip
 
         private int INFLATEReadBits(object[] d, byte num, int bae)
         {
+#if DEBUG
             Debug.Log("INFLATEReadBits");
+#endif
             if (num == 0)
                 return bae;
 
@@ -709,7 +729,9 @@ namespace jp.ootr.UdonZip
         /* given a data stream and a tree, decode a symbol */
         private ushort INFLATEDecodeSymbol(object[] d, object[] t)
         {
+#if DEBUG
             Debug.Log("INFLATEDecodeSymbol");
+#endif
             var dataSource = (byte[])d[INFLATE_DATA_SOURCE];
             var bitCount = (int)d[INFLATE_DATA_BITCOUNT];
             var tag = (int)d[INFLATE_DATA_TAG];
@@ -721,8 +743,13 @@ namespace jp.ootr.UdonZip
             {
                 if (sourceIndex >= dataSource.Length)
                 {
+                    // Return immediately on stream exhaustion: continuing with incomplete
+                    // tag would produce invalid symbols or loop with wrong Huffman state.
                     d[INFLATE_DATA_ERROR] = true;
-                    break; // stop reading after stream error
+                    d[INFLATE_DATA_TAG] = tag;
+                    d[INFLATE_DATA_BITCOUNT] = bitCount;
+                    d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
+                    return DECODE_ERROR;
                 }
                 // Cast to uint before shift to keep bit 31 from becoming a sign bit
                 tag |= unchecked((int)((uint)dataSource[sourceIndex] << bitCount));
@@ -855,6 +882,7 @@ namespace jp.ootr.UdonZip
             // (those bytes were pre-fetched into the bit buffer but not consumed as bits).
             sourceIndex -= bitCount / 8;
             bitCount = 0;
+            d[INFLATE_DATA_TAG] = 0; // clear stale tag so next fill doesn't OR into old bits
 
             // Need at least 4 bytes for the length/invlength header
             if (sourceIndex + 4 > source.Length) return false;
@@ -885,13 +913,10 @@ namespace jp.ootr.UdonZip
             destLen += length;
             sourceIndex += length;
 
-            // Make sure we start next block on a byte boundary
-            bitCount = 0;
-
             // Update the dictionary with new values
             d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
             d[INFLATE_DATA_DEST_LENGTH] = destLen;
-            d[INFLATE_DATA_BITCOUNT] = bitCount;
+            d[INFLATE_DATA_BITCOUNT] = bitCount; // already 0 from byte-alignment above
 
             return true;
         }
@@ -1087,9 +1112,11 @@ namespace jp.ootr.UdonZip
         private string ReadString(byte[] data, int addr, int length, bool useUtf8 = false)
         {
             if (length == 0) return "";
-            return useUtf8
-                ? Encoding.UTF8.GetString(data, addr, length)
-                : Encoding.ASCII.GetString(data, addr, length);
+            if (useUtf8) return Encoding.UTF8.GetString(data, addr, length);
+            // Encoding.ASCII is not available in the Udon runtime; cast each byte to char instead
+            var chars = new char[length];
+            for (var i = 0; i < length; i++) chars[i] = (char)data[addr + i];
+            return new string(chars);
         }
 
         private byte[] ReadByteArray(byte[] data, int addr, int length)
