@@ -706,8 +706,8 @@ namespace jp.ootr.UdonZip
                     d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
                     return bae; // avoid negative bitCount on stream exhaustion
                 }
-                // Cast to uint before shift to keep bit 31 from becoming a sign bit
-                tag |= unchecked((int)((uint)dataSource[sourceIndex] << bitCount));
+                // Default C# is unchecked; logical right shifts on tag ensure sign bits never propagate
+                tag |= dataSource[sourceIndex] << bitCount;
                 sourceIndex++;
                 bitCount += 8;
             }
@@ -751,8 +751,8 @@ namespace jp.ootr.UdonZip
                     d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
                     return DECODE_ERROR;
                 }
-                // Cast to uint before shift to keep bit 31 from becoming a sign bit
-                tag |= unchecked((int)((uint)dataSource[sourceIndex] << bitCount));
+                // Default C# is unchecked; logical right shifts on tag ensure sign bits never propagate
+                tag |= dataSource[sourceIndex] << bitCount;
                 sourceIndex++;
                 bitCount += 8;
             }
