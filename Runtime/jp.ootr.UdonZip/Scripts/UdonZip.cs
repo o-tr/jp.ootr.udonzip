@@ -29,6 +29,7 @@
  *     Version log:
  *         0.1.0: 2020-05-30; Initial version.
  *         0.1.1: 2024-04-10; Fix extract error.
+ *         0.1.2: 2024-xx-xx; Security hardening: bounds checking, null/false propagation, INFLATE safety.
  *
  */
 
@@ -64,12 +65,18 @@ namespace jp.ootr.UdonZip
 
         private const int INFLATE_DATA_LTREE = 6;
         private const int INFLATE_DATA_DTREE = 7;
+        private const int INFLATE_DATA_ERROR = 8; // stream error flag (bool)
 
         private const int INFLATE_TREE_TABLE = 0;
         private const int INFLATE_TREE_TRANS = 1;
 
         private const int COMPRESSION_METHOD_NONE = 0;
         private const int COMPRESSION_METHOD_INFLATE = 8;
+
+        // Safety limits
+        private const int MAX_UNCOMPRESSED_SIZE = 256 * 1024 * 1024; // 256 MB
+        private const int MAX_INFLATE_BLOCKS = 1000000;
+        private const ushort DECODE_ERROR = 0xFFFF;
 
         private const int EOCD_TOTAL_CDS = 0;
         private const int EOCD_SIZE_OF_CD = 1;
@@ -161,19 +168,23 @@ namespace jp.ootr.UdonZip
 
         /*
          * {
-         *     0: totalNumbersOfCDS (short)
-         *     1: sizeOfCentralDirectory (int)
-         *     2: centralDirectoryOffset (int)
+         *     0: totalNumbersOfCDS (ushort)
+         *     1: sizeOfCentralDirectory (uint)
+         *     2: centralDirectoryOffset (uint)
          *     3: comment (string)
          * }
          */
         private object[] ReadEOCD(byte[] data, int addr)
         {
+            // EOCD fixed header is 22 bytes
+            if (!EnsureRange(data, addr, 22)) return null;
+
             var eocd = new object[4];
             eocd[EOCD_TOTAL_CDS] = ReadUshort(data, addr + 10); // totalNumbersOfCDS
             eocd[EOCD_SIZE_OF_CD] = ReadUint(data, addr + 12); // sizeOfCentralDirectory
             eocd[EOCD_CD_OFFSET] = ReadUint(data, addr + 16); // centralDirectoryOffset
             var commentLength = ReadUshort(data, addr + 20);
+            if (!EnsureRange(data, addr + 22, commentLength)) return null;
             eocd[EOCD_COMMENT] = ReadString(data, addr + 22, commentLength); // comment
             return eocd;
         }
@@ -181,29 +192,38 @@ namespace jp.ootr.UdonZip
 
         /*
          * {
-         *     0: version (short)
-         *     1: version min to extract (short)
-         *     2: general purpose bit flag (short)
-         *     3: compression method (short)
-         *     4: file last modification time (short)
-         *     5: file last modification date (short)
-         *     6: CRC-32 of uncompressed data (int)
-         *     7: compressed size (int)
-         *     8: uncompressed size (int)
-         *     9: file name length (short) (n)
-         *     10: extra field length (short) (m)
-         *     11: file comment length (short) (k)
-         *     12: internal file attributes (short)
-         *     13: external file attributes (int)
-         *     14: offset of local file header (int)
+         *     0: version (ushort)
+         *     1: version min to extract (ushort)
+         *     2: general purpose bit flag (ushort)
+         *     3: compression method (ushort)
+         *     4: file last modification time (ushort)
+         *     5: file last modification date (ushort)
+         *     6: CRC-32 of uncompressed data (uint)
+         *     7: compressed size (uint)
+         *     8: uncompressed size (uint)
+         *     9: file name length (ushort) (n)
+         *     10: extra field length (ushort) (m)
+         *     11: file comment length (ushort) (k)
+         *     12: internal file attributes (ushort)
+         *     13: external file attributes (uint)
+         *     14: offset of local file header (uint)
          *     15: file name (string) (n)
-         *     16: extra field (object) (m)
+         *     16: extra field (string) (m)
          *     17: file comment (string) (k)
          *     18: start of next directory (int)
          * }
          */
         private object[] ReadCD(byte[] data, int addr)
         {
+            // CD fixed header is 46 bytes
+            if (!EnsureRange(data, addr, 46)) return null;
+
+            var nameLength = ReadUshort(data, addr + 28);
+            var extraFieldLength = ReadUshort(data, addr + 30);
+            var commentLength = ReadUshort(data, addr + 32);
+            var variableLen = (int)nameLength + (int)extraFieldLength + (int)commentLength;
+            if (!EnsureRange(data, addr + 46, variableLen)) return null;
+
             var cd = new object[19];
             cd[CD_VERSION] = ReadUshort(data, addr + 4); // version
             cd[CD_MIN_VERSION] = ReadUshort(data, addr + 6); // version min to extract
@@ -214,11 +234,8 @@ namespace jp.ootr.UdonZip
             cd[CD_CRC_32] = ReadUint(data, addr + 16); // CRC-32 of uncompressed data
             cd[CD_COMPRESSED_SIZE] = ReadUint(data, addr + 20); // compressed size
             cd[CD_UNCOMPRESSED_SIZE] = ReadUint(data, addr + 24); // uncompressed size
-            var nameLength = ReadUshort(data, addr + 28);
             cd[CD_NAME_LENGTH] = nameLength; // file name length
-            var extraFieldLength = ReadUshort(data, addr + 30);
             cd[CD_EXTRA_FIELD_LENGTH] = extraFieldLength; // extra field length
-            var commentLength = ReadUshort(data, addr + 32);
             cd[CD_COMMENT_LENGTH] = commentLength; // file comment length
             cd[CD_INTERNAL_FILE_ATTR] = ReadUshort(data, addr + 36); // internal file attributes
             cd[CD_EXTERNAL_FILE_ATTR] = ReadUint(data, addr + 38); // external file attributes
@@ -226,31 +243,38 @@ namespace jp.ootr.UdonZip
             cd[CD_NAME] = ReadString(data, addr + 46, nameLength); // file name
             cd[CD_EXTRA_FIELD] = ReadString(data, addr + 46 + nameLength, extraFieldLength); // extra field
             cd[CD_COMMENT] = ReadString(data, addr + 46 + nameLength + extraFieldLength, commentLength); // file comment
-            cd[CD_START_OF_NEXT_CD] =
-                addr + 46 + nameLength + extraFieldLength + commentLength; // start of next directory
+            cd[CD_START_OF_NEXT_CD] = addr + 46 + variableLen; // start of next directory (int)
 
             return cd;
         }
 
         /*
          * {
-         *     0: version min to extract (short)
-         *     1: general purpose bit flag (short)
-         *     2: compression method (short)
-         *     3: file last modification time (short)
-         *     4: file last modification date (short)
-         *     5: CRC-32 of uncompressed data (int)
-         *     6: compressed size (int)
-         *     7: uncompressed size (int)
-         *     8: file name length (short) (n)
-         *     9: extra field length (short) (m)
+         *     0: version min to extract (ushort)
+         *     1: general purpose bit flag (ushort)
+         *     2: compression method (ushort)
+         *     3: file last modification time (ushort)
+         *     4: file last modification date (ushort)
+         *     5: CRC-32 of uncompressed data (uint)
+         *     6: compressed size (uint)
+         *     7: uncompressed size (uint)
+         *     8: file name length (ushort) (n)
+         *     9: extra field length (ushort) (m)
          *     10: file name (string) (n)
-         *     11: extra field (object) (m)
+         *     11: extra field (byte[]) (m)
          *     12: start of data (int)
          * }
          */
         private object[] ReadLFH(byte[] data, int addr)
         {
+            // LFH fixed header is 30 bytes
+            if (!EnsureRange(data, addr, 30)) return null;
+
+            var nameLength = ReadUshort(data, addr + 26);
+            var extraFieldLength = ReadUshort(data, addr + 28);
+            var variableLen = (int)nameLength + (int)extraFieldLength;
+            if (!EnsureRange(data, addr + 30, variableLen)) return null;
+
             var lfh = new object[13];
             lfh[LFH_MIN_VERSION] = ReadUshort(data, addr + 4); // version min to extract
             lfh[LFH_BITFLAG] = ReadUshort(data, addr + 6); // general purpose bit flag
@@ -260,13 +284,11 @@ namespace jp.ootr.UdonZip
             lfh[LFH_CRC_32] = ReadUint(data, addr + 14); // CRC-32 of uncompressed data
             lfh[LFH_COMPRESSED_SIZE] = ReadUint(data, addr + 18); // compressed size
             lfh[LFH_UNCOMPRESSED_SIZE] = ReadUint(data, addr + 22); // uncompressed size
-            var nameLength = ReadUshort(data, addr + 26);
             lfh[LFH_NAME_LENGTH] = nameLength; // file name length
-            var extraFieldLength = ReadUshort(data, addr + 28);
             lfh[LFH_EXTRA_FIELD_LENGTH] = extraFieldLength; // extra field length
             lfh[LFH_NAME] = ReadString(data, addr + 30, nameLength); // file name
             lfh[LFH_EXTRA_FIELD] = ReadByteArray(data, addr + 30 + nameLength, extraFieldLength); // extra field
-            lfh[LFH_START_OF_DATA] = addr + 30 + nameLength + extraFieldLength; // start of data
+            lfh[LFH_START_OF_DATA] = addr + 30 + variableLen; // start of data (int)
 
             return lfh;
         }
@@ -277,58 +299,85 @@ namespace jp.ootr.UdonZip
          *     1: [
          *         {
          *             0: cd
-         *             1: uncompressed data (byte[]) (null if not uncompressed)
+         *             1: uncompressed data (byte[]) (null if not yet uncompressed)
          *             2: compressed data (byte[]) (null if not compressed)
          *         }
          *     ]
          * }
+         * Returns null on any parse error.
          */
 
         public object Extract(byte[] data)
         {
-            // Check if the INFLATE trees as been set up
+            // Minimum valid ZIP is 22 bytes (empty EOCD)
+            if (data == null || data.Length < 22) return null;
+
+            // Check if the INFLATE trees have been set up
             if (!hasBeenInit) Init();
 
             // Find start EOCD address
             var addrEOCD = FindEOCDAddress(data);
+            if (addrEOCD < 0) return null;
 
             // Parse the EOCD
             var eocd = ReadEOCD(data, addrEOCD);
+            if (eocd == null) return null;
 
             // Build the archive object
             var archive = new object[2];
             archive[ARCHIVE_EOCD] = eocd;
-            var entries = new object[(short)eocd[EOCD_TOTAL_CDS]];
+
+            var totalCds = (int)(ushort)eocd[EOCD_TOTAL_CDS];
+            if (totalCds < 0 || totalCds > 65535) return null;
+
+            var entries = new object[totalCds];
             archive[ARCHIVE_ENTIRES] = entries;
 
+            // Validate and resolve central directory offset
+            var cdOffsetUint = (uint)eocd[EOCD_CD_OFFSET];
+            if (cdOffsetUint >= (uint)data.Length) return null;
+            var addrOfLastDirectory = (int)cdOffsetUint;
+
             // Reads all CentralDirectories
-            var addrOfLastDirectory = (int)eocd[EOCD_CD_OFFSET];
-            for (var cdi = 0; cdi != (short)eocd[0]; cdi++)
+            for (var cdi = 0; cdi < totalCds; cdi++)
             {
                 var cd = ReadCD(data, addrOfLastDirectory);
+                if (cd == null) return null;
                 addrOfLastDirectory = (int)cd[CD_START_OF_NEXT_CD];
 
-                var lfh = ReadLFH(data, (int)cd[CD_OFFSET_LFH]);
+                var lfhOffsetUint = (uint)cd[CD_OFFSET_LFH];
+                if (lfhOffsetUint >= (uint)data.Length) return null;
+                var lfh = ReadLFH(data, (int)lfhOffsetUint);
+                if (lfh == null) return null;
 
                 var fileEntry = new object[3];
                 fileEntry[FILEENTRY_CD] = cd;
                 fileEntry[FILEENTRY_UNCOMPRESSED] = null;
                 fileEntry[FILEENTRY_COMPRESSED] = null;
 
-                if ((short)lfh[LFH_COMPRESSION_METHOD] == COMPRESSION_METHOD_NONE)
+                var compressionMethod = (int)(ushort)lfh[LFH_COMPRESSION_METHOD];
+                var startOfData = (int)lfh[LFH_START_OF_DATA];
+
+                if (compressionMethod == COMPRESSION_METHOD_NONE)
                 {
-                    var fileData = ReadByteArray(data, (int)lfh[LFH_START_OF_DATA], (int)lfh[LFH_UNCOMPRESSED_SIZE]);
-                    fileEntry[FILEENTRY_UNCOMPRESSED] = fileData;
+                    var sizeUint = (uint)lfh[LFH_UNCOMPRESSED_SIZE];
+                    if (sizeUint > (uint)MAX_UNCOMPRESSED_SIZE) return null;
+                    var size = (int)sizeUint;
+                    if (!EnsureRange(data, startOfData, size)) return null;
+                    fileEntry[FILEENTRY_UNCOMPRESSED] = ReadByteArray(data, startOfData, size);
                 }
-                else if ((short)lfh[LFH_COMPRESSION_METHOD] == COMPRESSION_METHOD_INFLATE)
+                else if (compressionMethod == COMPRESSION_METHOD_INFLATE)
                 {
-                    var fileData = ReadByteArray(data, (int)lfh[LFH_START_OF_DATA], (int)lfh[LFH_COMPRESSED_SIZE]);
-                    fileEntry[FILEENTRY_COMPRESSED] = fileData;
+                    var sizeUint = (uint)lfh[LFH_COMPRESSED_SIZE];
+                    if (sizeUint > (uint)MAX_UNCOMPRESSED_SIZE) return null;
+                    var size = (int)sizeUint;
+                    if (!EnsureRange(data, startOfData, size)) return null;
+                    fileEntry[FILEENTRY_COMPRESSED] = ReadByteArray(data, startOfData, size);
                 }
                 else
                 {
-                    Debug.LogError("Unsupported compression method: " + (short)lfh[LFH_COMPRESSION_METHOD]);
-                    Die();
+                    Debug.LogError("Unsupported compression method: " + compressionMethod);
+                    return null;
                 }
 
                 entries[cdi] = fileEntry;
@@ -339,6 +388,7 @@ namespace jp.ootr.UdonZip
 
         public string[] GetFileNames(object archive)
         {
+            if (archive == null) return null;
             var entries = (object[])((object[])archive)[ARCHIVE_ENTIRES];
             var fileNames = new string[entries.Length];
             for (var i = 0; i != entries.Length; i++)
@@ -354,6 +404,7 @@ namespace jp.ootr.UdonZip
 
         public object GetFile(object archive, string filePath)
         {
+            if (archive == null) return null;
             var entries = (object[])((object[])archive)[ARCHIVE_ENTIRES];
             for (var i = 0; i != entries.Length; i++)
             {
@@ -369,24 +420,34 @@ namespace jp.ootr.UdonZip
         // ReSharper disable once ReturnTypeCanBeEnumerable.Global
         public byte[] GetFileData(object file)
         {
+            if (file == null) return null;
+
             // Check if the file is already uncompressed, if so, just return it.
             var fileEntry = (object[])file;
             if (fileEntry[FILEENTRY_UNCOMPRESSED] != null) return (byte[])fileEntry[FILEENTRY_UNCOMPRESSED];
 
             // If was not uncompressed, lets decompress it.
             var cd = (object[])fileEntry[FILEENTRY_CD];
-            var uncompressedData = new byte[(int)cd[CD_UNCOMPRESSED_SIZE]];
-            var fileData = (byte[])fileEntry[FILEENTRY_COMPRESSED];
+            if (cd == null) return null;
 
-            // Switch depending on un-compression method
-            if ((short)cd[CD_COMPRESSION_METHOD] == COMPRESSION_METHOD_INFLATE)
+            var uncompressedSizeUint = (uint)cd[CD_UNCOMPRESSED_SIZE];
+            if (uncompressedSizeUint > (uint)MAX_UNCOMPRESSED_SIZE) return null;
+            var uncompressedSize = (int)uncompressedSizeUint;
+
+            var uncompressedData = new byte[uncompressedSize];
+            var fileData = (byte[])fileEntry[FILEENTRY_COMPRESSED];
+            if (fileData == null) return null;
+
+            // Switch depending on compression method
+            var compressionMethod = (int)(ushort)cd[CD_COMPRESSION_METHOD];
+            if (compressionMethod == COMPRESSION_METHOD_INFLATE)
             {
-                INFLATE(fileData, uncompressedData);
+                if (!INFLATE(fileData, uncompressedData)) return null;
             }
             else
             {
-                Debug.LogError("Unsupported compression method: " + (short)cd[CD_COMPRESSION_METHOD]);
-                Die();
+                Debug.LogError("Unsupported compression method: " + compressionMethod);
+                return null;
             }
 
             fileEntry[FILEENTRY_UNCOMPRESSED] = uncompressedData;
@@ -479,11 +540,11 @@ namespace jp.ootr.UdonZip
 
             for (i = 0; i < 32; ++i)
                 // dt.trans[i] = i;
-                ((ushort[])dt[INFLATE_TREE_TRANS])[i] = 0;
+                ((ushort[])dt[INFLATE_TREE_TRANS])[i] = (ushort)i;
         }
 
         // ReSharper disable once ParameterHidesMember
-        private void INFLATEBuildTree(object[] t, byte[] lengths, int off, int num)
+        private bool INFLATEBuildTree(object[] t, byte[] lengths, int off, int num)
         {
             Debug.Log("INFLATEBuildTree");
             var table = (ushort[])t[INFLATE_TREE_TABLE];
@@ -494,7 +555,12 @@ namespace jp.ootr.UdonZip
             Array.Clear(table, 0, 16);
 
             /* scan symbol lengths, and sum code length counts */
-            for (var i = 0; i < num; i++) table[lengths[off + i]]++;
+            for (var i = 0; i < num; i++)
+            {
+                byte l = lengths[off + i];
+                if (l >= 16) return false; // code length out of range
+                table[l]++;
+            }
 
             table[0] = 0; // ensure table[0] is 0
 
@@ -511,10 +577,13 @@ namespace jp.ootr.UdonZip
                 int len = lengths[off + i];
                 if (len != 0)
                 {
+                    if (offs[len] >= trans.Length) return false;
                     trans[offs[len]] = (ushort)i;
                     offs[len]++;
                 }
             }
+
+            return true;
         }
 
 
@@ -545,9 +614,19 @@ namespace jp.ootr.UdonZip
             d[INFLATE_DATA_BITCOUNT] = (int)d[INFLATE_DATA_BITCOUNT] - 1; // bitcount--
             if ((int)d[INFLATE_DATA_BITCOUNT] == -1)
             {
-                /* load next tag */
-                d[INFLATE_DATA_TAG] = (int)((byte[])d[INFLATE_DATA_SOURCE])[(int)d[INFLATE_DATA_SOURCE_INDEX]];
-                d[INFLATE_DATA_SOURCE_INDEX] = (int)d[INFLATE_DATA_SOURCE_INDEX] + 1;
+                var source = (byte[])d[INFLATE_DATA_SOURCE];
+                var sourceIndex = (int)d[INFLATE_DATA_SOURCE_INDEX];
+                if (sourceIndex >= source.Length)
+                {
+                    d[INFLATE_DATA_ERROR] = true;
+                    d[INFLATE_DATA_TAG] = 0;
+                }
+                else
+                {
+                    /* load next tag */
+                    d[INFLATE_DATA_TAG] = (int)source[sourceIndex];
+                }
+                d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex + 1;
                 d[INFLATE_DATA_BITCOUNT] = 7;
             }
 
@@ -570,9 +649,16 @@ namespace jp.ootr.UdonZip
 
             while (bitCount < 24)
             {
-                var dataSourceValue = sourceIndex >= dataSource.Length ? 0 : dataSource[sourceIndex];
+                if (sourceIndex >= dataSource.Length)
+                {
+                    d[INFLATE_DATA_ERROR] = true;
+                    // pad with zero bits
+                }
+                else
+                {
+                    tag |= dataSource[sourceIndex] << bitCount;
+                }
                 sourceIndex++;
-                tag |= dataSourceValue << bitCount;
                 bitCount += 8;
             }
 
@@ -602,9 +688,16 @@ namespace jp.ootr.UdonZip
 
             while (bitCount < 24)
             {
-                var dataSourceValue = sourceIndex >= dataSource.Length ? 0 : dataSource[sourceIndex];
+                if (sourceIndex >= dataSource.Length)
+                {
+                    d[INFLATE_DATA_ERROR] = true;
+                    // pad with zero bits
+                }
+                else
+                {
+                    tag |= dataSource[sourceIndex] << bitCount;
+                }
                 sourceIndex++;
-                tag |= dataSourceValue << bitCount;
                 bitCount += 8;
             }
 
@@ -613,6 +706,16 @@ namespace jp.ootr.UdonZip
             // get more bits while code value is above sum
             do
             {
+                if (len >= 15)
+                {
+                    // Huffman code longer than 15 bits — invalid stream
+                    d[INFLATE_DATA_TAG] = tag;
+                    d[INFLATE_DATA_BITCOUNT] = bitCount - len;
+                    d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
+                    d[INFLATE_DATA_ERROR] = true;
+                    return DECODE_ERROR;
+                }
+
                 cur = 2 * cur + (tag & 1);
                 tag >>= 1;
                 ++len;
@@ -625,7 +728,14 @@ namespace jp.ootr.UdonZip
             d[INFLATE_DATA_BITCOUNT] = bitCount - len;
             d[INFLATE_DATA_SOURCE_INDEX] = sourceIndex;
 
-            return trans[sum + cur];
+            var idx = sum + cur;
+            if (idx < 0 || idx >= trans.Length)
+            {
+                d[INFLATE_DATA_ERROR] = true;
+                return DECODE_ERROR;
+            }
+
+            return trans[idx];
         }
 
         /* given a stream and two trees, inflate a block of data */
@@ -633,16 +743,21 @@ namespace jp.ootr.UdonZip
         {
             var dest = (byte[])d[INFLATE_DATA_DEST];
             var destLen = (int)d[INFLATE_DATA_DEST_LENGTH];
+            var maxIterations = dest.Length + 65536;
             var iterationCount = 0;
 
             while (true)
             {
+                if ((bool)d[INFLATE_DATA_ERROR]) return false;
+                if (iterationCount > maxIterations) return false;
+                iterationCount++;
+
                 var sym = INFLATEDecodeSymbol(d, lt);
+                if (sym == DECODE_ERROR) return false;
 
 #if DEBUG
                 Debug.Log("We are on iteration " + iterationCount + " " + sym);
 #endif
-                iterationCount++;
 
                 // check for end of block
                 if (sym == 256)
@@ -653,46 +768,43 @@ namespace jp.ootr.UdonZip
 
                 if (sym < 256)
                 {
-                    // Ensure there is enough space in the destination array
-                    if (dest.Length <= destLen)
-                    {
-                        var tmp = new byte[dest.Length * 2];
-                        Buffer.BlockCopy(dest, 0, tmp, 0, dest.Length);
-                        dest = tmp;
-                        d[INFLATE_DATA_DEST] = dest; // Update the reference in the dictionary
-                    }
+                    if (destLen >= dest.Length) return false; // no room
 
                     dest[destLen++] = (byte)sym;
                 }
                 else
                 {
-                    sym -= 257;
+                    // Validate length symbol range (257-285)
+                    var symIdx = sym - 257;
+                    if (symIdx > 28) return false;
 
                     // possibly get more bits from length code
-                    var length = INFLATEReadBits(d, length_bits[sym], length_base[sym]);
-                    int dist = INFLATEDecodeSymbol(d, dt);
+                    var length = INFLATEReadBits(d, length_bits[symIdx], length_base[symIdx]);
+                    if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
+                    var dist = INFLATEDecodeSymbol(d, dt);
+                    if (dist == DECODE_ERROR) return false;
+                    if (dist > 29) return false; // invalid distance code
 
                     // possibly get more bits from distance code
-                    var offs = destLen - INFLATEReadBits(d, dist_bits[dist], dist_base[dist]);
+                    var distance = INFLATEReadBits(d, dist_bits[dist], dist_base[dist]);
+                    if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
+                    var offs = destLen - distance;
+                    if (offs < 0) return false; // distance exceeds available output
 
                     // Ensure there is enough space in the destination array
                     var requiredLength = destLen + length;
-                    if (dest.Length < requiredLength)
-                    {
-                        var tmp = new byte[Math.Max(dest.Length * 2, requiredLength)];
-                        Buffer.BlockCopy(dest, 0, tmp, 0, dest.Length);
-                        dest = tmp;
-                        d[INFLATE_DATA_DEST] = dest; // Update the reference in the dictionary
-                    }
+                    if (requiredLength > dest.Length) return false; // no room
 
-                    // Copy match
-                    Buffer.BlockCopy(dest, offs, dest, destLen, length);
+                    // LZ77 overlapping copy: byte-by-byte to handle self-overlap correctly
+                    for (var k = 0; k < length; k++) dest[destLen + k] = dest[offs + k];
                     destLen += length;
                 }
             }
         }
 
-/* inflate an uncompressed block of data */
+        /* inflate an uncompressed block of data */
         private bool INFLATEUncompressedBlock(object[] d)
         {
             // Cache frequently accessed variables
@@ -705,9 +817,13 @@ namespace jp.ootr.UdonZip
             // Unread from bit buffer
             while (bitCount > 8)
             {
+                if (sourceIndex <= 0) return false; // underflow guard
                 sourceIndex--;
                 bitCount -= 8;
             }
+
+            // Need at least 4 bytes for the length/invlength header
+            if (sourceIndex + 4 > source.Length) return false;
 
             // Get length
             var length = source[sourceIndex + 1] * 256 + source[sourceIndex];
@@ -721,15 +837,12 @@ namespace jp.ootr.UdonZip
 
             sourceIndex += 4;
 
+            // Check source has enough bytes for the block
+            if (sourceIndex + length > source.Length) return false;
+
             // Ensure there is enough space in the destination array
             var requiredLength = destLen + length;
-            if (dest.Length < requiredLength)
-            {
-                var tmp = new byte[Math.Max(dest.Length * 2, requiredLength)];
-                Buffer.BlockCopy(dest, 0, tmp, 0, dest.Length);
-                dest = tmp;
-                d[INFLATE_DATA_DEST] = dest;
-            }
+            if (requiredLength > dest.Length) return false;
 
             // Copy block
             Buffer.BlockCopy(source, sourceIndex, dest, destLen, length);
@@ -751,7 +864,7 @@ namespace jp.ootr.UdonZip
 
 
         /* given a data stream, decode dynamic trees from it */
-        private void INFLATEDecodeTrees(object[] d, object[] lt, object[] dt)
+        private bool INFLATEDecodeTrees(object[] d, object[] lt, object[] dt)
         {
             /* get 5 bits HLIT (257-286) */
             var hlit = INFLATEReadBits(d, 5, 257);
@@ -762,20 +875,35 @@ namespace jp.ootr.UdonZip
             /* get 4 bits HCLEN (4-19) */
             var hclen = INFLATEReadBits(d, 4, 4);
 
+            // Validate ranges per RFC 1951
+            if (hlit < 257 || hlit > 286) return false;
+            if (hdist < 1 || hdist > 32) return false;
+            if (hclen < 4 || hclen > 19) return false;
+
+            if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
             for (var i = 0; i < 19; ++i) lengths[i] = 0;
 
             /* read code lengths for code length alphabet */
             for (var i = 0; i < hclen; ++i) // 0-18
+            {
                 /* get 3 bits code length (0-7) */
                 lengths[clcidx[i]] = (byte)INFLATEReadBits(d, 3, 0);
+                if ((bool)d[INFLATE_DATA_ERROR]) return false;
+            }
 
             /* build code length tree */
-            INFLATEBuildTree(code_tree, lengths, 0, 19);
+            if (!INFLATEBuildTree(code_tree, lengths, 0, 19)) return false;
 
             var num = 0;
-            while (num < hlit + hdist)
+            var totalCodes = hlit + hdist;
+            while (num < totalCodes)
             {
+                if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
                 int sym = INFLATEDecodeSymbol(d, code_tree);
+                if (sym == DECODE_ERROR) return false;
+
                 if (sym < 16)
                 {
                     /* values 0-15 represent the actual code lengths */
@@ -786,42 +914,60 @@ namespace jp.ootr.UdonZip
                     int length;
                     if (sym == 16)
                     {
+                        if (num == 0) return false; // no previous code to copy
                         /* copy previous code length 3-6 times (read 2 bits) */
                         var prev = lengths[num - 1];
                         length = INFLATEReadBits(d, 2, 3);
+                        if ((bool)d[INFLATE_DATA_ERROR]) return false;
+                        if (num + length > totalCodes) return false; // would overflow
                         for (; length > 0; --length) lengths[num++] = prev;
                     }
                     else if (sym == 17)
                     {
                         /* repeat code length 0 for 3-10 times (read 3 bits) */
                         length = INFLATEReadBits(d, 3, 3);
+                        if ((bool)d[INFLATE_DATA_ERROR]) return false;
+                        if (num + length > totalCodes) return false;
                         for (; length > 0; --length) lengths[num++] = 0;
                     }
                     else if (sym == 18)
                     {
                         /* repeat code length 0 for 11-138 times (read 7 bits) */
                         length = INFLATEReadBits(d, 7, 11);
+                        if ((bool)d[INFLATE_DATA_ERROR]) return false;
+                        if (num + length > totalCodes) return false;
                         for (; length > 0; --length) lengths[num++] = 0;
+                    }
+                    else
+                    {
+                        return false; // unknown code length symbol
                     }
                 }
             }
 
             /* build dynamic trees */
-            INFLATEBuildTree(lt, lengths, 0, hlit);
-            INFLATEBuildTree(dt, lengths, hlit, hdist);
+            if (!INFLATEBuildTree(lt, lengths, 0, hlit)) return false;
+            if (!INFLATEBuildTree(dt, lengths, hlit, hdist)) return false;
+            return true;
         }
 
         /*
          * {
          *     0: source data (byte[])
          *     1: source index (int)
-         *     2: tag (byte)
-         *     3: bitcount (int)
+         *     2: dest (byte[])
+         *     3: dest length (int)
+         *     4: tag (int)
+         *     5: bitcount (int)
+         *     6: ltree (object[])
+         *     7: dtree (object[])
+         *     8: error flag (bool)
          * }
+         * Returns false on stream error.
          */
-        private void INFLATE(byte[] source, byte[] dest)
+        private bool INFLATE(byte[] source, byte[] dest)
         {
-            var d = new object[8];
+            var d = new object[9];
             d[INFLATE_DATA_SOURCE] = source;
             d[INFLATE_DATA_SOURCE_INDEX] = 0;
             d[INFLATE_DATA_DEST] = dest;
@@ -830,14 +976,21 @@ namespace jp.ootr.UdonZip
             d[INFLATE_DATA_BITCOUNT] = 0;
             d[INFLATE_DATA_LTREE] = NewEmptyTree();
             d[INFLATE_DATA_DTREE] = NewEmptyTree();
+            d[INFLATE_DATA_ERROR] = false;
 
+            var blockCount = 0;
             byte bfinal;
             do
             {
-                bfinal = INFLATEReadBit(d);
-                var btype = INFLATEReadBits(d, 2, 0);
+                if (blockCount++ > MAX_INFLATE_BLOCKS) return false;
 
-                var status = false;
+                bfinal = INFLATEReadBit(d);
+                if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
+                var btype = INFLATEReadBits(d, 2, 0);
+                if ((bool)d[INFLATE_DATA_ERROR]) return false;
+
+                bool status;
 
                 switch (btype)
                 {
@@ -851,16 +1004,20 @@ namespace jp.ootr.UdonZip
                         break;
                     case 2:
                         /* decompress block with dynamic huffman trees */
-                        INFLATEDecodeTrees(d, (object[])d[INFLATE_DATA_LTREE], (object[])d[INFLATE_DATA_DTREE]);
-                        // Debug.Log("Decoded trees complete.");
-                        status = INFLATEBlockData(d, (object[])d[INFLATE_DATA_LTREE],
-                            (object[])d[INFLATE_DATA_DTREE]);
+                        status = INFLATEDecodeTrees(d, (object[])d[INFLATE_DATA_LTREE], (object[])d[INFLATE_DATA_DTREE]);
+                        if (status)
+                            status = INFLATEBlockData(d, (object[])d[INFLATE_DATA_LTREE],
+                                (object[])d[INFLATE_DATA_DTREE]);
                         break;
                     default:
                         Debug.LogError("Invalid compression mode in INFLATE, reserved.");
-                        break;
+                        return false;
                 }
+
+                if (!status) return false;
             } while (bfinal == 0);
+
+            return true;
         }
 
         #endregion INFLATE
@@ -870,6 +1027,15 @@ namespace jp.ootr.UdonZip
         /**********************
          * I/O UTILITY METHODS
          **********************/
+
+        private bool EnsureRange(byte[] data, int addr, int length)
+        {
+            return data != null
+                && addr >= 0
+                && length >= 0
+                && (long)addr + length <= data.Length;
+        }
+
         private ushort ReadUshort(byte[] data, int addr)
         {
             return BitConverter.ToUInt16(data, addr);
@@ -883,11 +1049,13 @@ namespace jp.ootr.UdonZip
 
         private string ReadString(byte[] data, int addr, int length)
         {
-            return Encoding.ASCII.GetString(data, addr, length);
+            if (length == 0) return "";
+            return Encoding.UTF8.GetString(data, addr, length);
         }
 
         private byte[] ReadByteArray(byte[] data, int addr, int length)
         {
+            if (length == 0) return new byte[0];
             var b = new byte[length];
             Array.Copy(data, addr, b, 0, length);
             return b;
